@@ -1,6 +1,6 @@
 # mount-loop.sh
 
-**mount-loop.sh** is a versatile shell script designed to simplify the creation and management of loop devices, filesystems, and ramdisks on Linux systems. It automates the process of setting up loopback devices, creating files of specified or random sizes, and mounting them with or without filesystems. This tool is particularly useful for developers, system administrators, and testers who need to simulate block devices, perform filesystem operations, or test storage-related functionalities without the need for physical hardware.
+**mount-loop.sh** is a versatile shell script designed to simplify the creation and management of loop devices, filesystems, ramdisks, and devices with simulated faulty blocks on Linux systems. It automates the process of setting up loopback devices, creating files of specified or random sizes, and mounting them with or without filesystems. This tool is particularly useful for developers, system administrators, and testers who need to simulate block devices, perform filesystem operations, test storage-related functionalities, or simulate faulty storage conditions without the need for physical hardware.
 
 ## Table of Contents
 
@@ -13,7 +13,7 @@
   - [Examples](#examples)
 - [Use-Case Scenarios](#use-case-scenarios)
   - [Testing Disk Utilities](#testing-disk-utilities)
-  - [Simulating Storage Devices](#simulating-storage-devices)
+  - [Simulating Faulty Storage Devices](#simulating-faulty-storage-devices)
   - [Performance Benchmarking](#performance-benchmarking)
   - [Filesystem Experimentation](#filesystem-experimentation)
 - [How It Works](#how-it-works)
@@ -28,6 +28,7 @@
 - **Filesystem Support**: Optionally create filesystems (ext4) on loop devices and mount them for immediate use.
 - **Multiple Devices**: Create and manage multiple loop devices simultaneously with ease.
 - **Ramdisk Creation**: Set up ramdisks as loop devices for high-speed I/O operations.
+- **Faulty Block Simulation**: Create loop devices with specified faulty blocks to test error handling.
 - **User-Friendly Interface**: Simple command-line options with detailed help and examples.
 - **Automatic Cleanup**: Ensures temporary files and mounts are cleaned up after use.
 
@@ -45,6 +46,7 @@
   - `awk`
   - `uuidgen`
   - `mktemp`
+  - `dmsetup`
 
 ## Installation
 
@@ -74,13 +76,15 @@
 ./mount-loop.sh [OPTION]... [FILE]
 ```
 
-Set up loop devices for a given file, create new files of specified or random sizes, or create a ramdisk of specified size.
+Set up loop devices for a given file, create new files of specified or random sizes, create ramdisks, or simulate devices with faulty blocks.
 
 ### Options
 
 - `--help`: Display help and exit.
 - `automount <Size>`: Create a file of the specified size and set it up as a loop device.
 - `automountfs <Size>`: Same as `automount` but also create a filesystem and mount it.
+- `faultymount <Size> <BlockNumbers>`: Create a loop device with specified faulty blocks.
+- `faultymountfs <Size> <BlockNumbers>`: Same as `faultymount` but also create a filesystem and mount it.
 - `polymount <N> <Size>`: Create `N` files of the specified size and set them up as loop devices.
 - `polymountfs <N> <Size>`: Same as `polymount` but also create filesystems and mount them.
 - `polymount rand <N> <MinSize> <MaxSize>`: Create `N` files with random sizes between `MinSize` and `MaxSize`, set them up as loop devices.
@@ -111,6 +115,26 @@ Set up loop devices for a given file, create new files of specified or random si
 
   ```bash
   sudo ./mount-loop.sh automountfs 1G
+  ```
+
+#### Loop Devices with Faulty Blocks
+
+- **Create a 1G loop device with blocks 500 and 1000 marked as faulty**:
+
+  ```bash
+  sudo ./mount-loop.sh faultymount 1G 500,1000
+  ```
+
+- **Create a 1G loop device, create a filesystem, mount it, and mark blocks 500 to 510 as faulty**:
+
+  ```bash
+  sudo ./mount-loop.sh faultymountfs 1G 500-510
+  ```
+
+- **Using a combination of single blocks and ranges**:
+
+  ```bash
+  sudo ./mount-loop.sh faultymount 1G 500,1000-1010,1500
   ```
 
 #### Multiple Loop Devices
@@ -169,17 +193,24 @@ Developers working on disk utilities or applications that interact with block de
   sudo ./mount-loop.sh automountfs 5G
   ```
 
-### Simulating Storage Devices
+### Simulating Faulty Storage Devices
 
-System administrators can simulate various storage devices for training or testing purposes.
+Test how applications handle read/write errors due to bad sectors or faulty blocks.
 
-- **Scenario**: Setting up a virtual RAID array.
-- **Solution**: Create multiple loop devices and assemble them using `mdadm`.
+- **Scenario**: Testing the robustness of backup software when encountering disk errors.
+- **Solution**: Create a loop device with faulty blocks to simulate a failing disk.
 
   ```bash
-  sudo ./mount-loop.sh polymount 4 1G
-  # Assemble RAID after loop devices are created.
+  sudo ./mount-loop.sh faultymountfs 1G 500-510
   ```
+
+- **Testing read error handling**:
+
+  ```bash
+  sudo dd if=/dev/mapper/faulty-loop-loop0 of=/dev/null bs=512 skip=500 count=1
+  ```
+
+  This should produce an input/output error.
 
 ### Performance Benchmarking
 
@@ -214,16 +245,18 @@ The script automates the following processes:
 
 1. **File Creation**: Uses `dd` to create a file of the specified size, filled with zeros.
 2. **Loop Device Setup**: Utilizes `losetup` to associate the file with a loop device.
-3. **Filesystem Creation** (Optional): Formats the loop device with `mkfs.ext4`.
-4. **Mounting** (Optional): Mounts the loop device to a temporary directory created with `mktemp`.
-5. **User Interaction**: Waits for user input before proceeding to unmount and detach devices.
-6. **Cleanup**: Unmounts filesystems, detaches loop devices, deletes temporary files and directories.
+3. **Faulty Block Simulation** (Optional): Uses the Device Mapper with the `error` target to simulate faulty blocks.
+4. **Filesystem Creation** (Optional): Formats the loop device with `mkfs.ext4`.
+5. **Mounting** (Optional): Mounts the loop device to a temporary directory created with `mktemp`.
+6. **User Interaction**: Waits for user input before proceeding to unmount and detach devices.
+7. **Cleanup**: Unmounts filesystems, detaches loop devices, deletes temporary files and directories.
 
 ## Cleanup and Safety
 
 - **Automatic Cleanup**: The script ensures that all temporary files, loop devices, and mount points are cleaned up after use.
 - **User Prompts**: Before unmounting and detaching, the script waits for user confirmation, allowing for any necessary operations to be performed.
 - **Error Handling**: Includes checks and error messages for common issues, such as insufficient permissions or invalid input.
+- **Faulty Devices**: When creating devices with faulty blocks, the script uses the Device Mapper to safely simulate errors without affecting the underlying storage.
 
 ## Contributing
 
