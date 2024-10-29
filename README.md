@@ -285,7 +285,7 @@ Contributions are welcome! If you have suggestions, enhancements, or bug fixes, 
 
 ## License
 
-This project is licensed under the MIT License. See the [COPYING](COPYING) file for details.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ---
 
