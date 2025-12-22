@@ -19,26 +19,33 @@ show_help() {
     echo "Set up loop devices for a given file, create new files of specified or random size, or create a ramdisk of specified size."
     echo ""
     echo "  --help                     display this help and exit"
-    echo "  automount <Size>           automatically create a file of specified size and set it up as a loop device."
+    echo "  automount <Size>           automatically create a file of specified size in /tmp and set it up as a loop device."
     echo "  automountfs <Size>         same as automount but also create a filesystem and mount it."
-    echo "  faultymount <Size> <BlockNumbers>  create a loop device with specified faulty blocks."
-    echo "  faultymountfs <Size> <BlockNumbers>  same as faultymount but also create a filesystem and mount it."
-    echo "  polymount <N> <Size>       create N files of specified size and set them up as loop devices."
+    echo "  faultymount <Size> <BlockNumbers>      create a loop device with specified faulty blocks."
+    echo "  faultymountfs <Size> <BlockNumbers>    same as faultymount but also create a filesystem and mount it."
+    echo "  polymount <N> <Size>       create N files in /tmp of specified size and set them up as loop devices."
     echo "  polymountfs <N> <Size>     same as polymount but also create filesystems and mount them."
-    echo "  polymount rand <N> <MinSize> <MaxSize>  create N files with random sizes between MinSize and MaxSize, set them up as loop devices."
-    echo "  polymountfs rand <N> <MinSize> <MaxSize>  same as polymount rand but also create filesystems and mount them."
+    echo "  polymount rand <N> <MinSize> <MaxSize>          create N files with random sizes in /tmp."
+    echo "  polymountfs rand <N> <MinSize> <MaxSize>        same as above but also create filesystems and mount them."
+    echo "  custompolymount <BaseDir> <N> <Size>            like polymount, but create files under BaseDir instead of /tmp."
+    echo "  custompolymountfs <BaseDir> <N> <Size>          same as above but with filesystems and mounts."
+    echo "  custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>   random sizes, base directory configurable."
+    echo "  custompolymountfs rand <BaseDir> <N> <MinSize> <MaxSize> same as above but with filesystems and mounts."
+    echo "  custommount / custommountfs                     aliases for custompolymount / custompolymountfs."
     echo "  tmpfsmount <Size>          create a ramdisk of specified size as a loop device."
     echo "  tmpfsmountfs <Size>        same as tmpfsmount but also create a filesystem and mount it."
+    echo "  tmpfspolymount <N> <Size>   create N tmpfs-backed files of specified size and set them up as loop devices."
+    echo "  tmpfspolymountfs <N> <Size> same as tmpfspolymount but also create filesystems and mount them."
+    echo "  tmpfspolymount rand <N> <MinSize> <MaxSize>   like polymount rand, but using a shared tmpfs as backing store."
+    echo "  tmpfspolymountfs rand <N> <MinSize> <MaxSize> same as above but with filesystems and mounts."
     echo "  <FilePath>                 path to the existing file to set up as a loop device"
     echo ""
     echo "Examples:"
     echo "  $0 /path/to/your/file.img                 Set up an existing file as a loop device."
-    echo "  $0 automount 1G                           Create a 1G-sized file and set it up as a loop device."
+    echo "  $0 automount 1G                           Create a 1G-sized file in /tmp and set it up as a loop device."
     echo "  $0 automountfs 1G                         Same as above but also create a filesystem and mount it."
-    echo "  $0 faultymount 1G 500,1000                Create a 1G-sized loop device with blocks 500 and 1000 faulty."
-    echo "  $0 faultymountfs 1G 500-510               Same as above but also create a filesystem and mount it, blocks 500 to 510 faulty."
-    echo "  $0 polymount 5 1G                         Create 5 1G-sized files and set them up as loop devices."
-    echo "  $0 polymountfs 5 1G                       Same as above but also create filesystems and mount them."
+    echo "  $0 polymount 5 1G                         Create 5 1G-sized files in /tmp and set them up as loop devices."
+    echo "  $0 custompolymount /workspace 5 1G        Same as polymount, but images under /workspace."
     echo "  $0 tmpfsmount 1G                          Create a 1G ramdisk and set it up as a loop device."
     echo "  $0 tmpfsmountfs 1G                        Same as above but also create a filesystem and mount it."
     echo ""
@@ -307,6 +314,126 @@ polymount() {
     done
 }
 
+# NEW: Create loop devices like polymount, but with configurable base directory
+# Usage:
+#   custompolymount <BaseDir> <N> <Size>
+#   custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>
+custompolymount() {
+    CREATE_FS=$1
+    shift
+
+    RAND_MODE=false
+    declare -a SIZES
+
+    if [ "$1" == "rand" ]; then
+        # custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>
+        if [ "$#" -ne 5 ]; then
+            echo "Usage: $0 custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>"
+            exit 1
+        fi
+        RAND_MODE=true
+        BASEDIR="$2"
+        N="$3"
+        MIN_SIZE_BYTES=$(convert_size_to_bytes "$4")
+        MAX_SIZE_BYTES=$(convert_size_to_bytes "$5")
+    else
+        # custompolymount <BaseDir> <N> <Size>
+        if [ "$#" -ne 3 ]; then
+            echo "Usage: $0 custompolymount <BaseDir> <N> <Size>"
+            exit 1
+        fi
+        RAND_MODE=false
+        BASEDIR="$1"
+        N="$2"
+        SIZE_BYTES=$(convert_size_to_bytes "$3")
+    fi
+
+    if [ ! -d "$BASEDIR" ]; then
+        echo "Base directory does not exist or is not a directory: $BASEDIR"
+        exit 1
+    fi
+
+    declare -a LOOPDEVICES
+    declare -a FILEPATHS
+    declare -a MOUNTPOINTS
+
+    if [ "$RAND_MODE" = true ]; then
+        MIN="$MIN_SIZE_BYTES"
+        MAX="$MAX_SIZE_BYTES"
+    fi
+
+    for ((i=1; i<=N; i++)); do
+        if [ "$RAND_MODE" = true ]; then
+            BYTE_SIZE=$(generate_random_size "$MIN" "$MAX")
+        else
+            BYTE_SIZE="$SIZE_BYTES"
+        fi
+
+        GUID=$(uuidgen)
+        FILENAME="${GUID}.img"
+        FILEPATH="${BASEDIR}/${FILENAME}"
+
+        dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
+        if [ $? -ne 0 ]; then
+            echo "Failed to create file $FILEPATH"
+            continue
+        fi
+
+        LOOPDEVICE=$(losetup -fP --show "$FILEPATH")
+        if [ -z "$LOOPDEVICE" ]; then
+            echo "Error creating loop device for $FILEPATH."
+            rm -f "$FILEPATH"
+            continue
+        fi
+        echo "Loop device set up: $LOOPDEVICE (file: $FILEPATH, size=${BYTE_SIZE} bytes)"
+
+        if [ "$CREATE_FS" = true ]; then
+            mkfs.ext4 "$LOOPDEVICE" >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                echo "Failed to create filesystem on $LOOPDEVICE"
+                losetup -d "$LOOPDEVICE"
+                rm -f "$FILEPATH"
+                continue
+            fi
+
+            MOUNTPOINT=$(mktemp -d)
+            mount "$LOOPDEVICE" "$MOUNTPOINT"
+            if [ $? -ne 0 ]; then
+                echo "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
+                losetup -d "$LOOPDEVICE"
+                rm -f "$FILEPATH"
+                rmdir "$MOUNTPOINT"
+                continue
+            fi
+            echo "Loop device mounted at $MOUNTPOINT"
+
+            MOUNTPOINTS[$i]="$MOUNTPOINT"
+        fi
+
+        LOOPDEVICES[$i]="$LOOPDEVICE"
+        FILEPATHS[$i]="$FILEPATH"
+    done
+
+    echo "All custom-polymount loop devices set up. Press [Enter] to detach all loop devices."
+    read
+
+    for i in "${!LOOPDEVICES[@]}"; do
+        if [ -n "${LOOPDEVICES[$i]}" ]; then
+            if [ "$CREATE_FS" = true ] && [ -n "${MOUNTPOINTS[$i]}" ]; then
+                umount "${MOUNTPOINTS[$i]}"
+                rmdir "${MOUNTPOINTS[$i]}"
+            fi
+            losetup -d "${LOOPDEVICES[$i]}"
+            echo "Loop device detached: ${LOOPDEVICES[$i]}"
+
+            if [ -n "${FILEPATHS[$i]}" ]; then
+                rm -f "${FILEPATHS[$i]}"
+                echo "Backing file deleted: ${FILEPATHS[$i]}"
+            fi
+        fi
+    done
+}
+
 # Function to set up a loop device with faulty blocks
 setup_faulty_loop_device() {
     FILEPATH="$1"
@@ -376,6 +503,141 @@ setup_faulty_loop_device() {
         rm -f "$FILEPATH"
         echo "Temporary file deleted: $FILEPATH"
     fi
+}
+
+# Create multiple loop devices backed by a single tmpfs (optional filesystem + mount).
+# Usage (analog zu polymount):
+#   tmpfspolymount <N> <Size>
+#   tmpfspolymount rand <N> <MinSize> <MaxSize>
+tmpfspolymount() {
+    CREATE_FS=$1
+    shift
+
+    RAND_MODE=false
+    declare -a SIZES
+    TOTAL_BYTES=0
+
+    if [ "$1" == "rand" ]; then
+        if [ "$#" -ne 4 ]; then
+            echo "Usage: $0 tmpfspolymount rand <N> <MinSize> <MaxSize>"
+            exit 1
+        fi
+
+        RAND_MODE=true
+        N=$2
+        MIN_SIZE_BYTES=$(convert_size_to_bytes "$3")
+        MAX_SIZE_BYTES=$(convert_size_to_bytes "$4")
+
+        # Größen vorab auswürfeln und aufsummieren
+        for ((i=1; i<=N; i++)); do
+            SIZE_BYTES=$(generate_random_size "$MIN_SIZE_BYTES" "$MAX_SIZE_BYTES")
+            SIZES[$i]=$SIZE_BYTES
+            TOTAL_BYTES=$((TOTAL_BYTES + SIZE_BYTES))
+        done
+    else
+        if [ "$#" -ne 2 ]; then
+            echo "Usage: $0 tmpfspolymount <N> <Size>"
+            exit 1
+        fi
+
+        N=$1
+        SIZE_BYTES=$(convert_size_to_bytes "$2")
+        TOTAL_BYTES=$((N * SIZE_BYTES))
+    fi
+
+    TMPDIR=$(mktemp -d)
+    if [ ! -d "$TMPDIR" ]; then
+        echo "Failed to create temporary directory."
+        exit 1
+    fi
+
+    # Gemeinsames tmpfs für alle N Images
+    mount -t tmpfs -o size=${TOTAL_BYTES} tmpfs "$TMPDIR"
+    if [ $? -ne 0 ]; then
+        echo "Failed to mount tmpfs at $TMPDIR"
+        rmdir "$TMPDIR"
+        exit 1
+    fi
+    echo "tmpfs mounted at $TMPDIR (size=${TOTAL_BYTES} bytes)"
+
+    declare -a LOOPDEVICES
+    declare -a FILEPATHS
+    declare -a MOUNTPOINTS
+
+    for ((i=1; i<=N; i++)); do
+        if [ "$RAND_MODE" = true ]; then
+            BYTE_SIZE=${SIZES[$i]}
+        else
+            BYTE_SIZE=$SIZE_BYTES
+        fi
+
+        GUID=$(uuidgen)
+        FILENAME="${GUID}.img"
+        FILEPATH="$TMPDIR/${FILENAME}"
+
+        dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
+        if [ $? -ne 0 ]; then
+            echo "Failed to create file $FILEPATH"
+            continue
+        fi
+
+        LOOPDEVICE=$(losetup -fP --show "$FILEPATH")
+        if [ -z "$LOOPDEVICE" ]; then
+            echo "Error creating loop device for $FILEPATH."
+            rm -f "$FILEPATH"
+            continue
+        fi
+        echo "Loop device set up: $LOOPDEVICE (size=${BYTE_SIZE} bytes)"
+
+        if [ "$CREATE_FS" = true ]; then
+            mkfs.ext4 "$LOOPDEVICE" >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                echo "Failed to create filesystem on $LOOPDEVICE"
+                losetup -d "$LOOPDEVICE"
+                rm -f "$FILEPATH"
+                continue
+            fi
+
+            MOUNTPOINT=$(mktemp -d)
+            mount "$LOOPDEVICE" "$MOUNTPOINT"
+            if [ $? -ne 0 ]; then
+                echo "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
+                losetup -d "$LOOPDEVICE"
+                rm -f "$FILEPATH"
+                rmdir "$MOUNTPOINT"
+                continue
+            fi
+            echo "Loop device mounted at $MOUNTPOINT"
+
+            MOUNTPOINTS[$i]="$MOUNTPOINT"
+        fi
+
+        LOOPDEVICES[$i]="$LOOPDEVICE"
+        FILEPATHS[$i]="$FILEPATH"
+    done
+
+    echo "All tmpfs-backed loop devices set up. Press [Enter] to detach all loop devices."
+    read
+
+    for i in "${!LOOPDEVICES[@]}"; do
+        if [ -n "${LOOPDEVICES[$i]}" ]; then
+            if [ "$CREATE_FS" = true ] && [ -n "${MOUNTPOINTS[$i]}" ]; then
+                umount "${MOUNTPOINTS[$i]}"
+                rmdir "${MOUNTPOINTS[$i]}"
+            fi
+            losetup -d "${LOOPDEVICES[$i]}"
+            echo "Loop device detached: ${LOOPDEVICES[$i]}"
+
+            if [ -n "${FILEPATHS[$i]}" ]; then
+                rm -f "${FILEPATHS[$i]}"
+                echo "Backing file deleted: ${FILEPATHS[$i]}"
+            fi
+        fi
+    done
+
+    umount "$TMPDIR"
+    rmdir "$TMPDIR"
+    echo "tmpfs $TMPDIR unmounted and cleaned up."
 }
 
 # Function to parse faulty blocks and create an array
@@ -506,12 +768,37 @@ case "$1" in
         shift
         polymount true "$@"
         ;;
+    custompolymount)
+        shift
+        custompolymount false "$@"
+        ;;
+    custompolymountfs)
+        shift
+        custompolymount true "$@"
+        ;;
+    # Aliases: custommount == custompolymount
+    custommount)
+        shift
+        custompolymount false "$@"
+        ;;
+    custommountfs)
+        shift
+        custompolymount true "$@"
+        ;;
     tmpfsmount)
         if [ "$#" -ne 2 ]; then
             echo "Usage: $0 tmpfsmount <Size>"
             exit 1
         fi
         tmpfsmount "$2" false
+        ;;
+    tmpfspolymount)
+        shift
+        tmpfspolymount false "$@"
+        ;;
+    tmpfspolymountfs)
+        shift
+        tmpfspolymount true "$@"
         ;;
     tmpfsmountfs)
         if [ "$#" -ne 2 ]; then
@@ -528,4 +815,3 @@ case "$1" in
         setup_loop_device "$1" false
         ;;
 esac
-
