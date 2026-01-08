@@ -1,17 +1,49 @@
 #!/bin/bash
 
-# Check if script is running as root
-if [ "$EUID" -ne 0 ]; then
-    # Check for pkexec or sudo
-    if command -v pkexec >/dev/null 2>&1; then
-        exec pkexec "$0" "$@"
-    elif command -v sudo >/dev/null 2>&1; then
-        exec sudo "$0" "$@"
-    else
-        echo "Error: This script requires elevated privileges, but neither pkexec nor sudo is available."
-        exit 1
-    fi
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# pkexec does *not* reliably preserve the caller's working directory.
+# When we re-exec via pkexec/sudo we pass the original PWD via NW_ORIG_PWD
+# and restore it here so relative paths continue to work.
+if [ -n "${NW_ORIG_PWD-}" ] && [ -d "${NW_ORIG_PWD}" ]; then
+    cd "${NW_ORIG_PWD}" || true
 fi
+
+log_info() { printf '[+] %s\n' "$*"; }
+log_warn() { printf '[!] %s\n' "$*" >&2; }
+log_err()  { printf '[x] %s\n' "$*" >&2; }
+
+die() { log_err "$*"; exit 1; }
+
+ensure_root() {
+    # Only escalate when we are about to execute an operation that actually requires privileges.
+    if [ "${EUID}" -eq 0 ]; then
+        return 0
+    fi
+
+    # Resolve script path as robustly as possible (helps when invoked via relative paths).
+    local SELF="$0"
+    if [[ "$SELF" != */* ]]; then
+        SELF=$(command -v -- "$SELF" 2>/dev/null || echo "$SELF")
+    fi
+    if command -v realpath >/dev/null 2>&1; then
+        SELF=$(realpath -- "$SELF" 2>/dev/null || echo "$SELF")
+    elif command -v readlink >/dev/null 2>&1; then
+        SELF=$(readlink -f -- "$SELF" 2>/dev/null || echo "$SELF")
+    fi
+
+    if command -v pkexec >/dev/null 2>&1; then
+        # Preserve current working directory across pkexec.
+        exec pkexec /usr/bin/env NW_ORIG_PWD="$PWD" "$SELF" "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        # sudo usually preserves PWD, but we do this for consistency.
+        exec sudo /usr/bin/env NW_ORIG_PWD="$PWD" "$SELF" "$@"
+    else
+        die "This script requires elevated privileges, but neither pkexec nor sudo is available."
+    fi
+}
 
 # Function to display help message
 show_help() {
@@ -52,15 +84,27 @@ show_help() {
     echo "Note: This script requires elevated permissions. It will attempt to use pkexec or sudo."
 }
 
+require_cmds() {
+    local missing=0
+    for c in "$@"; do
+        if ! command -v "$c" >/dev/null 2>&1; then
+            log_err "Missing required command: $c"
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ] || exit 1
+}
+
 # Convert size specification to bytes
 convert_size_to_bytes() {
-    SIZE=$1
+    local SIZE=$1
+    local UNIT
+    local NUMBER
     UNIT=$(echo "$SIZE" | sed -E 's/[0-9\.]+//g' | tr '[:lower:]' '[:upper:]')
     NUMBER=$(echo "$SIZE" | sed -E 's/[^0-9\.]//g')
 
     if [ -z "$NUMBER" ]; then
-        echo "Invalid size value: $SIZE" >&2
-        exit 1
+        die "Invalid size value: $SIZE"
     fi
 
     case "$UNIT" in
@@ -77,73 +121,66 @@ convert_size_to_bytes() {
             BYTE_SIZE=$(awk "BEGIN {printf \"%.0f\", $NUMBER}")
             ;;
         *)
-            echo "Unknown size unit: $UNIT" >&2
-            exit 1
+            die "Unknown size unit: $UNIT"
             ;;
     esac
 
-    echo $BYTE_SIZE
+    echo "$BYTE_SIZE"
 }
 
 # Generate a random size within specified range
 generate_random_size() {
-    MIN_SIZE_BYTES=$1
-    MAX_SIZE_BYTES=$2
-    RANGE=$(($MAX_SIZE_BYTES - $MIN_SIZE_BYTES + 1))
+    local MIN_SIZE_BYTES=$1
+    local MAX_SIZE_BYTES=$2
+    local RANGE=$((MAX_SIZE_BYTES - MIN_SIZE_BYTES + 1))
 
     if [ "$RANGE" -le 0 ]; then
-        echo "Invalid size range." >&2
-        exit 1
+        die "Invalid size range."
     fi
 
-    RANDOM_BYTES=$(awk -v min=$MIN_SIZE_BYTES -v range=$RANGE 'BEGIN{srand(); print int(min+rand()*range)}')
-
-    echo $RANDOM_BYTES
+    # Seed once per invocation; good enough for sizes.
+    local RANDOM_BYTES
+    RANDOM_BYTES=$(awk -v min="$MIN_SIZE_BYTES" -v range="$RANGE" 'BEGIN{srand(); print int(min+rand()*range)}')
+    echo "$RANDOM_BYTES"
 }
 
 # Function to set up the loop device (optionally create filesystem and mount)
 setup_loop_device() {
-    FILEPATH="$1"
-    CREATE_FS="$2"
+    local FILEPATH="$1"
+    local CREATE_FS="$2"
+    local LOOPDEVICE
+    local MOUNTPOINT
 
-    LOOPDEVICE=$(losetup -fP --show "$FILEPATH")
-    if [ -z "$LOOPDEVICE" ]; then
-        echo "Error creating the loop device."
-        exit 1
-    fi
-    echo "Loop device set up: $LOOPDEVICE"
+    LOOPDEVICE=$(losetup -fP --show "$FILEPATH") || die "Error creating the loop device."
+    log_info "Loop device set up: $LOOPDEVICE"
 
     if [ "$CREATE_FS" = true ]; then
         # Create a filesystem on the loop device
-        mkfs.ext4 "$LOOPDEVICE" >/dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            echo "Failed to create filesystem on $LOOPDEVICE"
-            losetup -d "$LOOPDEVICE"
-            exit 1
+        if ! mkfs.ext4 -q "$LOOPDEVICE" >/dev/null 2>&1; then
+            losetup -d "$LOOPDEVICE" || true
+            die "Failed to create filesystem on $LOOPDEVICE"
         fi
 
         # Create a temporary mount point
         MOUNTPOINT=$(mktemp -d)
 
         # Mount the loop device
-        mount "$LOOPDEVICE" "$MOUNTPOINT"
-        if [ $? -ne 0 ]; then
-            echo "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
-            losetup -d "$LOOPDEVICE"
-            rmdir "$MOUNTPOINT"
-            exit 1
+        if ! mount "$LOOPDEVICE" "$MOUNTPOINT"; then
+            losetup -d "$LOOPDEVICE" || true
+            rmdir "$MOUNTPOINT" || true
+            die "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
         fi
-        echo "Loop device mounted at $MOUNTPOINT"
+        log_info "Loop device mounted at $MOUNTPOINT"
 
         echo "Press [Enter] to unmount and detach the loop device."
-        read
+        read -r
 
         # Unmount and clean up
-        umount "$MOUNTPOINT"
-        rmdir "$MOUNTPOINT"
+        umount "$MOUNTPOINT" || true
+        rmdir "$MOUNTPOINT" || true
     else
         echo "Press [Enter] to detach the loop device."
-        read
+        read -r
     fi
 
     cleanup "$LOOPDEVICE" "$FILEPATH"
@@ -151,32 +188,34 @@ setup_loop_device() {
 
 # Function for cleanup: detaching the loop device, and deleting the file
 cleanup() {
-    LOOPDEVICE=$1
-    FILEPATH=$2
+    local LOOPDEVICE=$1
+    local FILEPATH=$2
 
-    losetup -d "$LOOPDEVICE"
-    echo "Loop device detached: $LOOPDEVICE"
+    losetup -d "$LOOPDEVICE" || true
+    log_info "Loop device detached: $LOOPDEVICE"
 
     if [[ "$FILEPATH" == /tmp/*.img ]]; then
-        rm -f "$FILEPATH"
-        echo "Temporary file deleted: $FILEPATH"
+        rm -f "$FILEPATH" || true
+        log_info "Temporary file deleted: $FILEPATH"
     fi
 }
 
 # Function to automatically create a file of a specified size and set up as a loop device
 automount() {
+    local GUID
+    local FILENAME
+    local FILEPATH
+    local FILESIZE=$1
+    local CREATE_FS=$2
+
+    local BYTE_SIZE
     GUID=$(uuidgen)
     FILENAME="${GUID}.img"
     FILEPATH="/tmp/${FILENAME}"
-    FILESIZE=$1
-    CREATE_FS=$2
-
     BYTE_SIZE=$(convert_size_to_bytes "$FILESIZE")
 
-    dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
-    if [ $? -ne 0 ]; then
-        echo "Failed to create file $FILEPATH"
-        exit 1
+    if ! dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek="$BYTE_SIZE" status=none; then
+        die "Failed to create file $FILEPATH"
     fi
 
     setup_loop_device "$FILEPATH" "$CREATE_FS"
@@ -184,115 +223,117 @@ automount() {
 
 # Function to create a ramdisk as a loop device (optionally create filesystem and mount)
 tmpfsmount() {
-    RAMDISK_SIZE=$1
-    CREATE_FS=$2
+    local RAMDISK_SIZE=$1
+    local CREATE_FS=$2
 
+    local BYTE_SIZE
+    local TMPDIR
+    local FILEPATH
     BYTE_SIZE=$(convert_size_to_bytes "$RAMDISK_SIZE")
 
     TMPDIR=$(mktemp -d)
     if [ ! -d "$TMPDIR" ]; then
-        echo "Failed to create temporary directory."
-        exit 1
+        die "Failed to create temporary directory."
     fi
 
-    mount -t tmpfs -o size=${BYTE_SIZE} tmpfs $TMPDIR
-    if [ $? -ne 0 ]; then
-        echo "Failed to mount tmpfs at $TMPDIR"
-        rmdir "$TMPDIR"
-        exit 1
+    if ! mount -t tmpfs -o "size=${BYTE_SIZE}" tmpfs "$TMPDIR"; then
+        rmdir "$TMPDIR" || true
+        die "Failed to mount tmpfs at $TMPDIR"
     fi
-    echo "Ramdisk mounted at $TMPDIR"
+    log_info "Ramdisk mounted at $TMPDIR"
 
     FILEPATH="${TMPDIR}/ramdisk.img"
 
-    dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
-    if [ $? -ne 0 ]; then
-        echo "Failed to create file $FILEPATH"
-        umount "$TMPDIR"
-        rmdir "$TMPDIR"
-        exit 1
+    if ! dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek="$BYTE_SIZE" status=none; then
+        umount "$TMPDIR" || true
+        rmdir "$TMPDIR" || true
+        die "Failed to create file $FILEPATH"
     fi
 
     setup_loop_device "$FILEPATH" "$CREATE_FS"
 
     # Clean up ramdisk
-    umount "$TMPDIR"
-    rmdir "$TMPDIR"
-    echo "Ramdisk unmounted and cleaned up."
+    umount "$TMPDIR" || true
+    rmdir "$TMPDIR" || true
+    log_info "Ramdisk unmounted and cleaned up."
 }
 
 # Create loop devices with files of specified or random sizes (optionally create filesystem and mount)
 polymount() {
-    CREATE_FS=$1
+    local CREATE_FS=$1
     shift
 
     if [ "$1" == "rand" ]; then
         if [ "$#" -ne 4 ]; then
-            echo "Usage: $0 polymount rand <N> <MinSize> <MaxSize>"
-            exit 1
+            die "Usage: $0 polymount rand <N> <MinSize> <MaxSize>"
         fi
-        N=$2
-        MIN_SIZE_BYTES=$(convert_size_to_bytes $3)
-        MAX_SIZE_BYTES=$(convert_size_to_bytes $4)
+        local N=$2
+        local MIN_SIZE_BYTES
+        local MAX_SIZE_BYTES
+        MIN_SIZE_BYTES=$(convert_size_to_bytes "$3")
+        MAX_SIZE_BYTES=$(convert_size_to_bytes "$4")
     else
         if [ "$#" -ne 2 ]; then
-            echo "Usage: $0 polymount <N> <Size>"
-            exit 1
+            die "Usage: $0 polymount <N> <Size>"
         fi
-        N=$1
-        SIZE_BYTES=$(convert_size_to_bytes $2)
+        local N=$1
+        local SIZE_BYTES
+        SIZE_BYTES=$(convert_size_to_bytes "$2")
     fi
 
-    declare -a LOOPDEVICES
-    declare -a FILEPATHS
-    declare -a MOUNTPOINTS
+    declare -a LOOPDEVICES=()
+    declare -a FILEPATHS=()
+    declare -a MOUNTPOINTS=()
 
     for ((i=1; i<=N; i++)); do
+        local BYTE_SIZE
         if [ "$1" == "rand" ]; then
-            SIZE_BYTES=$(generate_random_size $MIN_SIZE_BYTES $MAX_SIZE_BYTES)
+            BYTE_SIZE=$(generate_random_size "$MIN_SIZE_BYTES" "$MAX_SIZE_BYTES")
+        else
+            BYTE_SIZE="$SIZE_BYTES"
         fi
 
-        BYTE_SIZE="$SIZE_BYTES"
-
+        local GUID
+        local FILENAME
+        local FILEPATH
+        local LOOPDEVICE
         GUID=$(uuidgen)
         FILENAME="${GUID}.img"
         FILEPATH="/tmp/${FILENAME}"
 
-        dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
-        if [ $? -ne 0 ]; then
-            echo "Failed to create file $FILEPATH"
+        if ! dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek="$BYTE_SIZE" status=none; then
+            log_err "Failed to create file $FILEPATH"
             continue
         fi
 
-        LOOPDEVICE=$(losetup -fP --show "$FILEPATH")
-        if [ -z "$LOOPDEVICE" ]; then
-            echo "Error creating loop device for $FILEPATH."
-            rm -f "$FILEPATH"
+        LOOPDEVICE=$(losetup -fP --show "$FILEPATH") || {
+            log_err "Error creating loop device for $FILEPATH."
+            rm -f "$FILEPATH" || true
             continue
-        fi
-        echo "Loop device set up: $LOOPDEVICE"
+        }
+        log_info "Loop device set up: $LOOPDEVICE"
 
         if [ "$CREATE_FS" = true ]; then
-            mkfs.ext4 "$LOOPDEVICE" >/dev/null 2>&1
-            if [ $? -ne 0 ]; then
-                echo "Failed to create filesystem on $LOOPDEVICE"
-                losetup -d "$LOOPDEVICE"
-                rm -f "$FILEPATH"
+            if ! mkfs.ext4 -q "$LOOPDEVICE" >/dev/null 2>&1; then
+                log_err "Failed to create filesystem on $LOOPDEVICE"
+                losetup -d "$LOOPDEVICE" || true
+                rm -f "$FILEPATH" || true
                 continue
             fi
 
+            local MOUNTPOINT
             MOUNTPOINT=$(mktemp -d)
-            mount "$LOOPDEVICE" "$MOUNTPOINT"
-            if [ $? -ne 0 ]; then
-                echo "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
-                losetup -d "$LOOPDEVICE"
-                rm -f "$FILEPATH"
-                rmdir "$MOUNTPOINT"
+            if ! mount "$LOOPDEVICE" "$MOUNTPOINT"; then
+                log_err "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
+                losetup -d "$LOOPDEVICE" || true
+                rm -f "$FILEPATH" || true
+                rmdir "$MOUNTPOINT" || true
                 continue
             fi
-            echo "Loop device mounted at $MOUNTPOINT"
-
+            log_info "Loop device mounted at $MOUNTPOINT"
             MOUNTPOINTS+=("$MOUNTPOINT")
+        else
+            MOUNTPOINTS+=("")
         fi
 
         LOOPDEVICES+=("$LOOPDEVICE")
@@ -300,17 +341,17 @@ polymount() {
     done
 
     echo "All loop devices set up. Press [Enter] to detach all loop devices."
-    read
+    read -r
 
     for i in "${!LOOPDEVICES[@]}"; do
-        if [ "$CREATE_FS" = true ]; then
-            umount "${MOUNTPOINTS[$i]}"
-            rmdir "${MOUNTPOINTS[$i]}"
+        if [ "$CREATE_FS" = true ] && [ -n "${MOUNTPOINTS[$i]}" ]; then
+            umount "${MOUNTPOINTS[$i]}" || true
+            rmdir "${MOUNTPOINTS[$i]}" || true
         fi
-        losetup -d "${LOOPDEVICES[$i]}"
-        echo "Loop device detached: ${LOOPDEVICES[$i]}"
-        rm -f "${FILEPATHS[$i]}"
-        echo "Temporary file deleted: ${FILEPATHS[$i]}"
+        losetup -d "${LOOPDEVICES[$i]}" || true
+        log_info "Loop device detached: ${LOOPDEVICES[$i]}"
+        rm -f "${FILEPATHS[$i]}" || true
+        log_info "Temporary file deleted: ${FILEPATHS[$i]}"
     done
 }
 
@@ -319,136 +360,132 @@ polymount() {
 #   custompolymount <BaseDir> <N> <Size>
 #   custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>
 custompolymount() {
-    CREATE_FS=$1
+    local CREATE_FS=$1
     shift
 
-    RAND_MODE=false
-    declare -a SIZES
+    local RAND_MODE=false
 
     if [ "$1" == "rand" ]; then
         # custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>
         if [ "$#" -ne 5 ]; then
-            echo "Usage: $0 custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>"
-            exit 1
+            die "Usage: $0 custompolymount rand <BaseDir> <N> <MinSize> <MaxSize>"
         fi
         RAND_MODE=true
-        BASEDIR="$2"
-        N="$3"
+        local BASEDIR="$2"
+        local N="$3"
+        local MIN_SIZE_BYTES
+        local MAX_SIZE_BYTES
         MIN_SIZE_BYTES=$(convert_size_to_bytes "$4")
         MAX_SIZE_BYTES=$(convert_size_to_bytes "$5")
     else
         # custompolymount <BaseDir> <N> <Size>
         if [ "$#" -ne 3 ]; then
-            echo "Usage: $0 custompolymount <BaseDir> <N> <Size>"
-            exit 1
+            die "Usage: $0 custompolymount <BaseDir> <N> <Size>"
         fi
-        RAND_MODE=false
-        BASEDIR="$1"
-        N="$2"
+        local BASEDIR="$1"
+        local N="$2"
+        local SIZE_BYTES
         SIZE_BYTES=$(convert_size_to_bytes "$3")
     fi
 
     if [ ! -d "$BASEDIR" ]; then
-        echo "Base directory does not exist or is not a directory: $BASEDIR"
-        exit 1
+        die "Base directory does not exist or is not a directory: $BASEDIR"
     fi
 
-    declare -a LOOPDEVICES
-    declare -a FILEPATHS
-    declare -a MOUNTPOINTS
-
-    if [ "$RAND_MODE" = true ]; then
-        MIN="$MIN_SIZE_BYTES"
-        MAX="$MAX_SIZE_BYTES"
-    fi
+    declare -a LOOPDEVICES=()
+    declare -a FILEPATHS=()
+    declare -a MOUNTPOINTS=()
 
     for ((i=1; i<=N; i++)); do
+        local BYTE_SIZE
         if [ "$RAND_MODE" = true ]; then
-            BYTE_SIZE=$(generate_random_size "$MIN" "$MAX")
+            BYTE_SIZE=$(generate_random_size "$MIN_SIZE_BYTES" "$MAX_SIZE_BYTES")
         else
             BYTE_SIZE="$SIZE_BYTES"
         fi
 
+        local GUID
+        local FILENAME
+        local FILEPATH
+        local LOOPDEVICE
         GUID=$(uuidgen)
         FILENAME="${GUID}.img"
         FILEPATH="${BASEDIR}/${FILENAME}"
 
-        dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
-        if [ $? -ne 0 ]; then
-            echo "Failed to create file $FILEPATH"
+        if ! dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek="$BYTE_SIZE" status=none; then
+            log_err "Failed to create file $FILEPATH"
             continue
         fi
 
-        LOOPDEVICE=$(losetup -fP --show "$FILEPATH")
-        if [ -z "$LOOPDEVICE" ]; then
-            echo "Error creating loop device for $FILEPATH."
-            rm -f "$FILEPATH"
+        LOOPDEVICE=$(losetup -fP --show "$FILEPATH") || {
+            log_err "Error creating loop device for $FILEPATH."
+            rm -f "$FILEPATH" || true
             continue
-        fi
-        echo "Loop device set up: $LOOPDEVICE (file: $FILEPATH, size=${BYTE_SIZE} bytes)"
+        }
+        log_info "Loop device set up: $LOOPDEVICE (file: $FILEPATH, size=${BYTE_SIZE} bytes)"
 
         if [ "$CREATE_FS" = true ]; then
-            mkfs.ext4 "$LOOPDEVICE" >/dev/null 2>&1
-            if [ $? -ne 0 ]; then
-                echo "Failed to create filesystem on $LOOPDEVICE"
-                losetup -d "$LOOPDEVICE"
-                rm -f "$FILEPATH"
+            if ! mkfs.ext4 -q "$LOOPDEVICE" >/dev/null 2>&1; then
+                log_err "Failed to create filesystem on $LOOPDEVICE"
+                losetup -d "$LOOPDEVICE" || true
+                rm -f "$FILEPATH" || true
                 continue
             fi
 
+            local MOUNTPOINT
             MOUNTPOINT=$(mktemp -d)
-            mount "$LOOPDEVICE" "$MOUNTPOINT"
-            if [ $? -ne 0 ]; then
-                echo "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
-                losetup -d "$LOOPDEVICE"
-                rm -f "$FILEPATH"
-                rmdir "$MOUNTPOINT"
+            if ! mount "$LOOPDEVICE" "$MOUNTPOINT"; then
+                log_err "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
+                losetup -d "$LOOPDEVICE" || true
+                rm -f "$FILEPATH" || true
+                rmdir "$MOUNTPOINT" || true
                 continue
             fi
-            echo "Loop device mounted at $MOUNTPOINT"
+            log_info "Loop device mounted at $MOUNTPOINT"
 
-            MOUNTPOINTS[$i]="$MOUNTPOINT"
+            MOUNTPOINTS+=("$MOUNTPOINT")
+        else
+            MOUNTPOINTS+=("")
         fi
 
-        LOOPDEVICES[$i]="$LOOPDEVICE"
-        FILEPATHS[$i]="$FILEPATH"
+        LOOPDEVICES+=("$LOOPDEVICE")
+        FILEPATHS+=("$FILEPATH")
     done
 
     echo "All custom-polymount loop devices set up. Press [Enter] to detach all loop devices."
-    read
+    read -r
 
     for i in "${!LOOPDEVICES[@]}"; do
-        if [ -n "${LOOPDEVICES[$i]}" ]; then
-            if [ "$CREATE_FS" = true ] && [ -n "${MOUNTPOINTS[$i]}" ]; then
-                umount "${MOUNTPOINTS[$i]}"
-                rmdir "${MOUNTPOINTS[$i]}"
-            fi
-            losetup -d "${LOOPDEVICES[$i]}"
-            echo "Loop device detached: ${LOOPDEVICES[$i]}"
-
-            if [ -n "${FILEPATHS[$i]}" ]; then
-                rm -f "${FILEPATHS[$i]}"
-                echo "Backing file deleted: ${FILEPATHS[$i]}"
-            fi
+        if [ "$CREATE_FS" = true ] && [ -n "${MOUNTPOINTS[$i]}" ]; then
+            umount "${MOUNTPOINTS[$i]}" || true
+            rmdir "${MOUNTPOINTS[$i]}" || true
         fi
+        losetup -d "${LOOPDEVICES[$i]}" || true
+        log_info "Loop device detached: ${LOOPDEVICES[$i]}"
+
+        rm -f "${FILEPATHS[$i]}" || true
+        log_info "Backing file deleted: ${FILEPATHS[$i]}"
     done
 }
 
 # Function to set up a loop device with faulty blocks
 setup_faulty_loop_device() {
-    FILEPATH="$1"
-    CREATE_FS="$2"
-    FAULTY_BLOCKS="$3"
+    local FILEPATH="$1"
+    local CREATE_FS="$2"
+    local FAULTY_BLOCKS="$3"
 
-    LOOPDEVICE=$(losetup -fP --show "$FILEPATH")
-    if [ -z "$LOOPDEVICE" ]; then
-        echo "Error creating the loop device."
-        exit 1
-    fi
-    echo "Loop device set up: $LOOPDEVICE"
+    local LOOPDEVICE
+    local MOUNTPOINT
+    local DM_DEVICE_NAME
+    local MAPPED_DEVICE
+
+    LOOPDEVICE=$(losetup -fP --show "$FILEPATH") || die "Error creating the loop device."
+    log_info "Loop device set up: $LOOPDEVICE"
 
     # Get total number of blocks
-    BLOCK_SIZE=512  # Standard block size
+    local BLOCK_SIZE=512  # Standard block size
+    local TOTAL_SIZE
+    local TOTAL_BLOCKS
     TOTAL_SIZE=$(blockdev --getsize64 "$LOOPDEVICE")
     TOTAL_BLOCKS=$((TOTAL_SIZE / BLOCK_SIZE))
 
@@ -460,48 +497,44 @@ setup_faulty_loop_device() {
 
     # Create Device Mapper device
     DM_DEVICE_NAME="faulty-loop-$(basename "$LOOPDEVICE")"
-    echo -e "$DM_TABLE" | dmsetup create "$DM_DEVICE_NAME"
+    printf '%b' "$DM_TABLE" | dmsetup create "$DM_DEVICE_NAME" >/dev/null
 
     MAPPED_DEVICE="/dev/mapper/$DM_DEVICE_NAME"
-    echo "Faulty loop device created: $MAPPED_DEVICE"
+    log_info "Faulty loop device created: $MAPPED_DEVICE"
 
     if [ "$CREATE_FS" = true ]; then
-        mkfs.ext4 "$MAPPED_DEVICE" >/dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            echo "Failed to create filesystem on $MAPPED_DEVICE"
-            dmsetup remove "$DM_DEVICE_NAME"
-            losetup -d "$LOOPDEVICE"
-            exit 1
+        if ! mkfs.ext4 -q "$MAPPED_DEVICE" >/dev/null 2>&1; then
+            dmsetup remove "$DM_DEVICE_NAME" || true
+            losetup -d "$LOOPDEVICE" || true
+            die "Failed to create filesystem on $MAPPED_DEVICE"
         fi
 
         MOUNTPOINT=$(mktemp -d)
-        mount "$MAPPED_DEVICE" "$MOUNTPOINT"
-        if [ $? -ne 0 ]; then
-            echo "Failed to mount $MAPPED_DEVICE at $MOUNTPOINT"
-            dmsetup remove "$DM_DEVICE_NAME"
-            losetup -d "$LOOPDEVICE"
-            rmdir "$MOUNTPOINT"
-            exit 1
+        if ! mount "$MAPPED_DEVICE" "$MOUNTPOINT"; then
+            dmsetup remove "$DM_DEVICE_NAME" || true
+            losetup -d "$LOOPDEVICE" || true
+            rmdir "$MOUNTPOINT" || true
+            die "Failed to mount $MAPPED_DEVICE at $MOUNTPOINT"
         fi
-        echo "Faulty loop device mounted at $MOUNTPOINT"
+        log_info "Faulty loop device mounted at $MOUNTPOINT"
 
         echo "Press [Enter] to unmount and detach the loop device."
-        read
+        read -r
 
-        umount "$MOUNTPOINT"
-        rmdir "$MOUNTPOINT"
+        umount "$MOUNTPOINT" || true
+        rmdir "$MOUNTPOINT" || true
     else
         echo "Press [Enter] to detach the loop device."
-        read
+        read -r
     fi
 
-    dmsetup remove "$DM_DEVICE_NAME"
-    losetup -d "$LOOPDEVICE"
-    echo "Faulty loop device detached and cleaned up."
+    dmsetup remove "$DM_DEVICE_NAME" || true
+    losetup -d "$LOOPDEVICE" || true
+    log_info "Faulty loop device detached and cleaned up."
 
     if [[ "$FILEPATH" == /tmp/*.img ]]; then
-        rm -f "$FILEPATH"
-        echo "Temporary file deleted: $FILEPATH"
+        rm -f "$FILEPATH" || true
+        log_info "Temporary file deleted: $FILEPATH"
     fi
 }
 
@@ -510,140 +543,140 @@ setup_faulty_loop_device() {
 #   tmpfspolymount <N> <Size>
 #   tmpfspolymount rand <N> <MinSize> <MaxSize>
 tmpfspolymount() {
-    CREATE_FS=$1
+    local CREATE_FS=$1
     shift
 
-    RAND_MODE=false
-    declare -a SIZES
-    TOTAL_BYTES=0
+    local RAND_MODE=false
+    declare -a SIZES=()
+    local TOTAL_BYTES=0
 
     if [ "$1" == "rand" ]; then
         if [ "$#" -ne 4 ]; then
-            echo "Usage: $0 tmpfspolymount rand <N> <MinSize> <MaxSize>"
-            exit 1
+            die "Usage: $0 tmpfspolymount rand <N> <MinSize> <MaxSize>"
         fi
 
         RAND_MODE=true
-        N=$2
+        local N=$2
+        local MIN_SIZE_BYTES
+        local MAX_SIZE_BYTES
         MIN_SIZE_BYTES=$(convert_size_to_bytes "$3")
         MAX_SIZE_BYTES=$(convert_size_to_bytes "$4")
 
         # Größen vorab auswürfeln und aufsummieren
         for ((i=1; i<=N; i++)); do
+            local SIZE_BYTES
             SIZE_BYTES=$(generate_random_size "$MIN_SIZE_BYTES" "$MAX_SIZE_BYTES")
-            SIZES[$i]=$SIZE_BYTES
+            SIZES[$i]="$SIZE_BYTES"
             TOTAL_BYTES=$((TOTAL_BYTES + SIZE_BYTES))
         done
     else
         if [ "$#" -ne 2 ]; then
-            echo "Usage: $0 tmpfspolymount <N> <Size>"
-            exit 1
+            die "Usage: $0 tmpfspolymount <N> <Size>"
         fi
 
-        N=$1
+        local N=$1
+        local SIZE_BYTES
         SIZE_BYTES=$(convert_size_to_bytes "$2")
         TOTAL_BYTES=$((N * SIZE_BYTES))
     fi
 
+    local TMPDIR
     TMPDIR=$(mktemp -d)
     if [ ! -d "$TMPDIR" ]; then
-        echo "Failed to create temporary directory."
-        exit 1
+        die "Failed to create temporary directory."
     fi
 
     # Gemeinsames tmpfs für alle N Images
-    mount -t tmpfs -o size=${TOTAL_BYTES} tmpfs "$TMPDIR"
-    if [ $? -ne 0 ]; then
-        echo "Failed to mount tmpfs at $TMPDIR"
-        rmdir "$TMPDIR"
-        exit 1
+    if ! mount -t tmpfs -o size=${TOTAL_BYTES} tmpfs "$TMPDIR"; then
+        rmdir "$TMPDIR" || true
+        die "Failed to mount tmpfs at $TMPDIR"
     fi
-    echo "tmpfs mounted at $TMPDIR (size=${TOTAL_BYTES} bytes)"
+    log_info "tmpfs mounted at $TMPDIR (size=${TOTAL_BYTES} bytes)"
 
-    declare -a LOOPDEVICES
-    declare -a FILEPATHS
-    declare -a MOUNTPOINTS
+    declare -a LOOPDEVICES=()
+    declare -a FILEPATHS=()
+    declare -a MOUNTPOINTS=()
 
     for ((i=1; i<=N; i++)); do
+        local BYTE_SIZE
         if [ "$RAND_MODE" = true ]; then
-            BYTE_SIZE=${SIZES[$i]}
+            BYTE_SIZE="${SIZES[$i]}"
         else
-            BYTE_SIZE=$SIZE_BYTES
+            BYTE_SIZE="$SIZE_BYTES"
         fi
 
+        local GUID
+        local FILENAME
+        local FILEPATH
+        local LOOPDEVICE
         GUID=$(uuidgen)
         FILENAME="${GUID}.img"
         FILEPATH="$TMPDIR/${FILENAME}"
 
-        dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
-        if [ $? -ne 0 ]; then
-            echo "Failed to create file $FILEPATH"
+        if ! dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek="$BYTE_SIZE" status=none; then
+            log_err "Failed to create file $FILEPATH"
             continue
         fi
 
-        LOOPDEVICE=$(losetup -fP --show "$FILEPATH")
-        if [ -z "$LOOPDEVICE" ]; then
-            echo "Error creating loop device for $FILEPATH."
-            rm -f "$FILEPATH"
+        LOOPDEVICE=$(losetup -fP --show "$FILEPATH") || {
+            log_err "Error creating loop device for $FILEPATH."
+            rm -f "$FILEPATH" || true
             continue
-        fi
-        echo "Loop device set up: $LOOPDEVICE (size=${BYTE_SIZE} bytes)"
+        }
+        log_info "Loop device set up: $LOOPDEVICE (size=${BYTE_SIZE} bytes)"
 
         if [ "$CREATE_FS" = true ]; then
-            mkfs.ext4 "$LOOPDEVICE" >/dev/null 2>&1
-            if [ $? -ne 0 ]; then
-                echo "Failed to create filesystem on $LOOPDEVICE"
-                losetup -d "$LOOPDEVICE"
-                rm -f "$FILEPATH"
+            if ! mkfs.ext4 -q "$LOOPDEVICE" >/dev/null 2>&1; then
+                log_err "Failed to create filesystem on $LOOPDEVICE"
+                losetup -d "$LOOPDEVICE" || true
+                rm -f "$FILEPATH" || true
                 continue
             fi
 
+            local MOUNTPOINT
             MOUNTPOINT=$(mktemp -d)
-            mount "$LOOPDEVICE" "$MOUNTPOINT"
-            if [ $? -ne 0 ]; then
-                echo "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
-                losetup -d "$LOOPDEVICE"
-                rm -f "$FILEPATH"
-                rmdir "$MOUNTPOINT"
+            if ! mount "$LOOPDEVICE" "$MOUNTPOINT"; then
+                log_err "Failed to mount $LOOPDEVICE at $MOUNTPOINT"
+                losetup -d "$LOOPDEVICE" || true
+                rm -f "$FILEPATH" || true
+                rmdir "$MOUNTPOINT" || true
                 continue
             fi
-            echo "Loop device mounted at $MOUNTPOINT"
+            log_info "Loop device mounted at $MOUNTPOINT"
 
-            MOUNTPOINTS[$i]="$MOUNTPOINT"
+            MOUNTPOINTS+=("$MOUNTPOINT")
+        else
+            MOUNTPOINTS+=("")
         fi
 
-        LOOPDEVICES[$i]="$LOOPDEVICE"
-        FILEPATHS[$i]="$FILEPATH"
+        LOOPDEVICES+=("$LOOPDEVICE")
+        FILEPATHS+=("$FILEPATH")
     done
 
     echo "All tmpfs-backed loop devices set up. Press [Enter] to detach all loop devices."
-    read
+    read -r
 
     for i in "${!LOOPDEVICES[@]}"; do
-        if [ -n "${LOOPDEVICES[$i]}" ]; then
-            if [ "$CREATE_FS" = true ] && [ -n "${MOUNTPOINTS[$i]}" ]; then
-                umount "${MOUNTPOINTS[$i]}"
-                rmdir "${MOUNTPOINTS[$i]}"
-            fi
-            losetup -d "${LOOPDEVICES[$i]}"
-            echo "Loop device detached: ${LOOPDEVICES[$i]}"
-
-            if [ -n "${FILEPATHS[$i]}" ]; then
-                rm -f "${FILEPATHS[$i]}"
-                echo "Backing file deleted: ${FILEPATHS[$i]}"
-            fi
+        if [ "$CREATE_FS" = true ] && [ -n "${MOUNTPOINTS[$i]}" ]; then
+            umount "${MOUNTPOINTS[$i]}" || true
+            rmdir "${MOUNTPOINTS[$i]}" || true
         fi
+        losetup -d "${LOOPDEVICES[$i]}" || true
+        log_info "Loop device detached: ${LOOPDEVICES[$i]}"
+
+        rm -f "${FILEPATHS[$i]}" || true
+        log_info "Backing file deleted: ${FILEPATHS[$i]}"
     done
 
-    umount "$TMPDIR"
-    rmdir "$TMPDIR"
-    echo "tmpfs $TMPDIR unmounted and cleaned up."
+    umount "$TMPDIR" || true
+    rmdir "$TMPDIR" || true
+    log_info "tmpfs $TMPDIR unmounted and cleaned up."
 }
 
 # Function to parse faulty blocks and create an array
 parse_faulty_blocks() {
-    FAULTY_BLOCKS_STR="$1"
-    TOTAL_BLOCKS="$2"
+    local FAULTY_BLOCKS_STR="$1"
+    local TOTAL_BLOCKS="$2"
     FAULTY_BLOCKS_ARRAY=()
 
     IFS=',' read -ra ADDR <<< "$FAULTY_BLOCKS_STR"
@@ -653,14 +686,12 @@ parse_faulty_blocks() {
             START=${RANGE[0]}
             END=${RANGE[1]}
             if [ "$START" -gt "$END" ] || [ "$END" -ge "$TOTAL_BLOCKS" ]; then
-                echo "Invalid block range: $BLOCK_SPEC"
-                exit 1
+                die "Invalid block range: $BLOCK_SPEC"
             fi
             FAULTY_BLOCKS_ARRAY+=("$START-$END")
         else
             if [ "$BLOCK_SPEC" -ge "$TOTAL_BLOCKS" ]; then
-                echo "Invalid block number: $BLOCK_SPEC"
-                exit 1
+                die "Invalid block number: $BLOCK_SPEC"
             fi
             FAULTY_BLOCKS_ARRAY+=("$BLOCK_SPEC")
         fi
@@ -669,12 +700,14 @@ parse_faulty_blocks() {
 
 # Function to create Device Mapper table
 create_dm_table() {
-    LOOPDEVICE="$1"
-    TOTAL_BLOCKS="$2"
+    local LOOPDEVICE="$1"
+    local TOTAL_BLOCKS="$2"
     DM_TABLE=""
-    CURRENT_BLOCK=0
+    local CURRENT_BLOCK=0
 
     # Sort faulty blocks
+    local SORTED_BLOCKS
+    # shellcheck disable=SC2207
     SORTED_BLOCKS=($(printf '%s\n' "${FAULTY_BLOCKS_ARRAY[@]}" | sort -n -t '-' -k1,1))
 
     for BLOCK_SPEC in "${SORTED_BLOCKS[@]}"; do
@@ -709,109 +742,146 @@ create_dm_table() {
 
 # Updated automount function to handle faulty blocks
 automount_faulty() {
+    local GUID
+    local FILENAME
+    local FILEPATH
+    local FILESIZE=$1
+    local CREATE_FS=$2
+    local FAULTY_BLOCKS=$3
+
+    local BYTE_SIZE
     GUID=$(uuidgen)
     FILENAME="${GUID}.img"
     FILEPATH="/tmp/${FILENAME}"
-    FILESIZE=$1
-    CREATE_FS=$2
-    FAULTY_BLOCKS=$3
-
     BYTE_SIZE=$(convert_size_to_bytes "$FILESIZE")
 
-    dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek=$BYTE_SIZE status=none
-    if [ $? -ne 0 ]; then
-        echo "Failed to create file $FILEPATH"
-        exit 1
+    if ! dd if=/dev/zero of="$FILEPATH" bs=1 count=0 seek="$BYTE_SIZE" status=none; then
+        die "Failed to create file $FILEPATH"
     fi
 
     setup_faulty_loop_device "$FILEPATH" "$CREATE_FS" "$FAULTY_BLOCKS"
 }
 
 # Main logic
-case "$1" in
+ORIG_ARGS=("$@")
+
+case "${1-}" in
     --help)
         show_help
         ;;
     automount)
         if [ "$#" -ne 2 ]; then
-            echo "Usage: $0 automount <Size>"
-            exit 1
+            show_help
+            die "Usage: $0 automount <Size>"
         fi
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen
         automount "$2" false
         ;;
     automountfs)
         if [ "$#" -ne 2 ]; then
-            echo "Usage: $0 automountfs <Size>"
-            exit 1
+            show_help
+            die "Usage: $0 automountfs <Size>"
         fi
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen mkfs.ext4 mount umount
         automount "$2" true
         ;;
     faultymount)
         if [ "$#" -ne 3 ]; then
-            echo "Usage: $0 faultymount <Size> <BlockNumbers>"
-            exit 1
+            show_help
+            die "Usage: $0 faultymount <Size> <BlockNumbers>"
         fi
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen dmsetup blockdev
         automount_faulty "$2" false "$3"
         ;;
     faultymountfs)
         if [ "$#" -ne 3 ]; then
-            echo "Usage: $0 faultymountfs <Size> <BlockNumbers>"
-            exit 1
+            show_help
+            die "Usage: $0 faultymountfs <Size> <BlockNumbers>"
         fi
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen dmsetup blockdev mkfs.ext4 mount umount
         automount_faulty "$2" true "$3"
         ;;
     polymount)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen
         shift
         polymount false "$@"
         ;;
     polymountfs)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen mkfs.ext4 mount umount
         shift
         polymount true "$@"
         ;;
     custompolymount)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen
         shift
         custompolymount false "$@"
         ;;
     custompolymountfs)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen mkfs.ext4 mount umount
         shift
         custompolymount true "$@"
         ;;
     # Aliases: custommount == custompolymount
     custommount)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen
         shift
         custompolymount false "$@"
         ;;
     custommountfs)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen mkfs.ext4 mount umount
         shift
         custompolymount true "$@"
         ;;
     tmpfsmount)
         if [ "$#" -ne 2 ]; then
-            echo "Usage: $0 tmpfsmount <Size>"
-            exit 1
+            show_help
+            die "Usage: $0 tmpfsmount <Size>"
         fi
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd mount umount
         tmpfsmount "$2" false
         ;;
     tmpfspolymount)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen mount umount
         shift
         tmpfspolymount false "$@"
         ;;
     tmpfspolymountfs)
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd uuidgen mount umount mkfs.ext4
         shift
         tmpfspolymount true "$@"
         ;;
     tmpfsmountfs)
         if [ "$#" -ne 2 ]; then
-            echo "Usage: $0 tmpfsmountfs <Size>"
-            exit 1
+            show_help
+            die "Usage: $0 tmpfsmountfs <Size>"
         fi
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup dd mount umount mkfs.ext4
         tmpfsmount "$2" true
         ;;
     *)
         if [ "$#" -ne 1 ]; then
             show_help
-            exit 1
+            die "Unknown/invalid command."
         fi
+        if [ ! -e "$1" ]; then
+            die "File does not exist: $1"
+        fi
+        ensure_root "${ORIG_ARGS[@]}"
+        require_cmds losetup
         setup_loop_device "$1" false
         ;;
 esac
